@@ -45,20 +45,16 @@ export class CalendarEventParticipantService {
     participantsToCreate,
     participantsToUpdate,
     transactionScope,
-    calendarChannel,
-    connectedAccount,
     workspaceId,
   }: {
     participantsToCreate: FetchedCalendarEventParticipantWithCalendarEventId[];
     participantsToUpdate: FetchedCalendarEventParticipantWithCalendarEventId[];
     transactionScope: WorkspaceTransactionScope;
-    calendarChannel: CalendarChannelEntity;
-    connectedAccount: ConnectedAccountEntity;
     workspaceId: string;
-  }): Promise<void> {
+  }): Promise<CalendarEventParticipantWorkspaceEntity[]> {
     const authContext = buildSystemAuthContext(workspaceId);
 
-    await this.globalWorkspaceOrmManager.executeInWorkspaceContext(
+    return this.globalWorkspaceOrmManager.executeInWorkspaceContext(
       async () => {
         const chunkedParticipantsToUpdate = chunk(participantsToUpdate, 200);
 
@@ -66,6 +62,8 @@ export class CalendarEventParticipantService {
           transactionScope.getRepository<CalendarEventParticipantWorkspaceEntity>(
             'calendarEventParticipant',
           );
+
+        const participantsToInsert = [...participantsToCreate];
 
         for (const participantsToUpdateChunk of chunkedParticipantsToUpdate) {
           const existingCalendarEventParticipants =
@@ -137,16 +135,16 @@ export class CalendarEventParticipantService {
               partialEntity: participant,
             })),
           );
-          participantsToCreate.push(...newCalendarEventParticipants);
+          participantsToInsert.push(...newCalendarEventParticipants);
         }
 
-        const chunkedParticipantsToCreate = chunk(participantsToCreate, 200);
+        const chunkedParticipantsToInsert = chunk(participantsToInsert, 200);
         const savedParticipants: CalendarEventParticipantWorkspaceEntity[] = [];
 
-        for (const participantsToCreateChunk of chunkedParticipantsToCreate) {
+        for (const participantsToInsertChunk of chunkedParticipantsToInsert) {
           const { identifiers } =
             await calendarEventParticipantRepository.insert(
-              participantsToCreateChunk,
+              participantsToInsertChunk,
             );
 
           const insertedParticipants =
@@ -157,22 +155,43 @@ export class CalendarEventParticipantService {
           savedParticipants.push(...insertedParticipants);
         }
 
-        if (calendarChannel.isContactAutoCreationEnabled) {
-          await this.messageQueueService.add<CreateCompanyAndContactJobData>(
-            CreateCompanyAndContactJob.name,
-            {
-              workspaceId,
-              connectedAccount,
-              contactsToCreate: savedParticipants.map((participant) => ({
-                handle: participant.handle ?? '',
-                displayName:
-                  participant.displayName ?? participant.handle ?? '',
-              })),
-              source: FieldActorSource.CALENDAR,
-            },
-          );
-        }
+        return savedParticipants;
+      },
+      authContext,
+      { lite: true },
+    );
+  }
 
+  public async matchParticipantsAndEnqueueContactCreationJob({
+    savedParticipants,
+    calendarChannel,
+    connectedAccount,
+    workspaceId,
+  }: {
+    savedParticipants: CalendarEventParticipantWorkspaceEntity[];
+    calendarChannel: CalendarChannelEntity;
+    connectedAccount: ConnectedAccountEntity;
+    workspaceId: string;
+  }): Promise<void> {
+    if (calendarChannel.isContactAutoCreationEnabled) {
+      await this.messageQueueService.add<CreateCompanyAndContactJobData>(
+        CreateCompanyAndContactJob.name,
+        {
+          workspaceId,
+          connectedAccount,
+          contactsToCreate: savedParticipants.map((participant) => ({
+            handle: participant.handle ?? '',
+            displayName: participant.displayName ?? participant.handle ?? '',
+          })),
+          source: FieldActorSource.CALENDAR,
+        },
+      );
+    }
+
+    const authContext = buildSystemAuthContext(workspaceId);
+
+    await this.globalWorkspaceOrmManager.executeInWorkspaceContext(
+      async () => {
         await this.matchParticipantService.matchParticipants({
           participants: savedParticipants,
           objectMetadataName: 'calendarEventParticipant',
